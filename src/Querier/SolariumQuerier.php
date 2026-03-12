@@ -71,7 +71,7 @@ class SolariumQuerier extends AbstractQuerier
 
     public function setQuery(Query $query): self
     {
-        $this->query = $query;
+        parent::setQuery($query);
         $this->appendCoreAliasesToQuery();
         return $this;
     }
@@ -144,17 +144,32 @@ class SolariumQuerier extends AbstractQuerier
 
             $result = $client->suggester($suggesterQuery);
 
+            $limit = $this->query ? $this->query->getLimit() : 10;
+            $seen = [];
             $suggestions = [];
             foreach ($result as $dictionary) {
                 foreach ($dictionary as $term) {
                     foreach ($term->getSuggestions() as $suggestion) {
+                        $value = trim(strip_tags($suggestion['term']));
+                        if ($value === '') {
+                            continue;
+                        }
+                        $key = mb_strtolower($value);
+                        if (isset($seen[$key])) {
+                            continue;
+                        }
+                        $seen[$key] = true;
                         $suggestions[] = [
-                            'value' => $suggestion['term'],
+                            'value' => $value,
                             'data' => $suggestion['weight'] ?? 1,
                         ];
                     }
                 }
             }
+
+            // Sort by weight descending, keep top results.
+            usort($suggestions, fn($a, $b) => $b['data'] <=> $a['data']);
+            $suggestions = array_slice($suggestions, 0, $limit);
 
             return $this->response
                 ->setSuggestions($suggestions)
@@ -178,9 +193,32 @@ class SolariumQuerier extends AbstractQuerier
             $solrFields = [$suggestOptions['solr_field']];
         }
 
-        // If _text_ is in the list, use only _text_.
-        if (in_array('_text_', $solrFields)) {
-            $solrFields = ['_text_'];
+        // Resolve "auto": stored text and string fields, preferring _txt.
+        if (empty($solrFields) || in_array('auto', $solrFields)) {
+            $allowedSuffixes = ['_txt', '_ss', '_s'];
+            $solrCore = $this->getSolrCore();
+            $txtPrefixes = [];
+            $candidates = [];
+            foreach ($solrCore->mapsOrderedByStructure() as $map) {
+                $fieldName = $map->fieldName();
+                foreach ($allowedSuffixes as $suffix) {
+                    if (substr($fieldName, -strlen($suffix)) === $suffix) {
+                        $prefix = substr($fieldName, 0, -strlen($suffix));
+                        $candidates[] = ['name' => $fieldName, 'suffix' => $suffix, 'prefix' => $prefix];
+                        if ($suffix === '_txt') {
+                            $txtPrefixes[$prefix] = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            $solrFields = [];
+            foreach ($candidates as $c) {
+                if ($c['suffix'] !== '_txt' && isset($txtPrefixes[$c['prefix']])) {
+                    continue;
+                }
+                $solrFields[] = $c['name'];
+            }
         }
 
         if (empty($solrFields)) {
@@ -419,13 +457,18 @@ class SolariumQuerier extends AbstractQuerier
             $allQuery = clone $this->select;
             $allQuery
                 ->setFields(['id'])
-                ->setRows(null)
-                ->setStart(null);
+                ->setStart(0);
 
             if ($allQuery->getGrouping()->getFields()) {
-                $allQuery->getGrouping()
-                    ->setLimit(null)
-                    ->setOffset(null);
+                // Solr default group.limit is 1, so set it
+                // explicitly to get all documents per group.
+                $allQuery
+                    ->setRows(100)
+                    ->getGrouping()
+                    ->setLimit(1000000)
+                    ->setOffset(0);
+            } else {
+                $allQuery->setRows(1000000);
             }
 
             $resultSetAll = $this->solariumClient->execute($allQuery);
@@ -544,12 +587,14 @@ class SolariumQuerier extends AbstractQuerier
     /**
      * Configure EDisMax per-request and keep only foldable query fields.
      *
-     * Also disable SOW to avoid splitting tokens like "949.0252" into too
-     * many clauses.
+     * Also disable SOW to avoid splitting tokens like "949.0252" into
+     * too many clauses.
      *
      * The number of query fields is limited to avoid exceeding Solr's
-     * maxClauseCount (default 1024). With many fields, each search term
-     * creates a clause per field, quickly hitting the limit.
+     * maxClauseCount (default 1024). With many fields, each search
+     * term creates a clause per field, and each clause is expanded by
+     * the analyzer (lowercasing, ASCII folding, synonyms…), quickly
+     * hitting the limit.
      *
      * If the catchall field `_text_` exists, use it instead of listing
      * all fields individually.
@@ -575,6 +620,8 @@ class SolariumQuerier extends AbstractQuerier
             return $this;
         }
 
+        $maxFields = $this->maxQueryFields();
+
         $existing = trim((string) $dismax->getQueryFields());
 
         if ($existing !== '') {
@@ -585,7 +632,7 @@ class SolariumQuerier extends AbstractQuerier
                 fn ($p) => isset($allowed[preg_replace('~\^.*$~', '', $p)])
             );
             if ($kept) {
-                $kept = array_slice($kept, 0, 100);
+                $kept = array_slice($kept, 0, $maxFields);
                 $dismax->setQueryFields(implode(' ', $kept));
             }
             return $this;
@@ -605,7 +652,7 @@ class SolariumQuerier extends AbstractQuerier
                 }
             }
             $foldable = array_merge($priority, $rest);
-            $foldable = array_slice($foldable, 0, 100);
+            $foldable = array_slice($foldable, 0, $maxFields);
             $dismax->setQueryFields(implode(' ', $foldable));
         }
 
@@ -652,9 +699,13 @@ class SolariumQuerier extends AbstractQuerier
             );
             $allowedFields = array_diff($allFields, $excludedFields);
             if ($allowedFields) {
-                // Limit fields to avoid clause explosion. Use DisMax with
-                // restricted qf for efficient multi-field search.
-                $allowedFields = array_slice($allowedFields, 0, 400);
+                // Limit fields to avoid clause explosion. Use DisMax
+                // with restricted qf for efficient multi-field search.
+                $allowedFields = array_slice(
+                    array_values($allowedFields),
+                    0,
+                    $this->maxQueryFields()
+                );
                 $dismax = $this->select->getDisMax();
                 $dismax->setQueryFields(implode(' ', $allowedFields));
             }
@@ -1027,6 +1078,26 @@ class SolariumQuerier extends AbstractQuerier
     }
 
     /**
+     * Estimate the max number of query fields (qf) to stay under
+     * Solr's maxClauseCount (1024).
+     *
+     * Each query term generates one clause per qf field, and the
+     * analyzer may expand each clause (lowercase, ASCII folding,
+     * synonyms…). A conservative expansion factor of 5 is used.
+     */
+    protected function maxQueryFields(): int
+    {
+        $q = trim($this->query->getQuery()
+            . ' ' . $this->query->getQueryRefine());
+        // Count whitespace-separated tokens as a rough term estimate.
+        $terms = max(1, preg_match_all('/\S+/', $q));
+        // expansion ≈ 5 (lowercase + folding + synonyms + variants).
+        $max = (int) floor(1024 / ($terms * 5));
+        // At least 10 fields, at most 100.
+        return max(10, min(100, $max));
+    }
+
+    /**
      * Get fields with custom boosts (different from default 1).
      *
      * @return string[] Array of "field^boost" strings
@@ -1034,7 +1105,7 @@ class SolariumQuerier extends AbstractQuerier
     protected function getCustomBoostedFields(): array
     {
         $coreBoosts = $this->solrCore->setting('field_boost') ?: [];
-        $queryBoosts = (array) $this->query->getFieldBoosts();
+        $queryBoosts = $this->query->getFieldBoosts();
         $merged = array_merge($coreBoosts, $queryBoosts);
 
         $result = [];
@@ -1055,42 +1126,49 @@ class SolariumQuerier extends AbstractQuerier
             return $this;
         }
 
-        // Skip if using _text_ catchall - no need for additional fields.
-        $dismax = $this->select->getDisMax();
-        $existing = trim((string) $dismax->getQueryFields());
-        if ($existing === '_text_') {
+        // Boosts from the index and from the query.
+        $coreBoosts = $this->solrCore->setting('field_boost', []);
+        $queryBoosts = $this->query->getFieldBoosts();
+        $merged = array_merge($coreBoosts, $queryBoosts);
+
+        if (!$merged) {
             return $this;
         }
 
-        // DisMax is the only querier for now (not standard, not eDisMax).
-        // Boosts from the index and from the query.
-        // In practice, solr manage boost only at search time, so the difference
-        // is only for configuration by the user.
-        // Important: when used, the full list of fields should be set.
-        // Note: field_boost is stored as array [field => boost] for solarium,
-        // that matches solr string format "field1 field2^2".
-        $coreBoosts = $this->solrCore->setting('field_boost', []);
-        $queryBoosts = (array) $this->query->getFieldBoosts();
-        $merged = array_merge($coreBoosts, $queryBoosts);
+        $dismax = $this->select->getDisMax();
+        $existing = trim((string) $dismax->getQueryFields());
 
-        if ($merged) {
-            $qf = [];
-            foreach ($merged as $field => $boost) {
-                $boost = (float) $boost;
-                // Skip ^1 boost (default) - it's useless and lengthens query.
-                if ($boost === 1.0) {
-                    $qf[] = $field;
-                } elseif ($boost > 0) {
-                    $qf[] = "$field^$boost";
-                } else {
-                    $qf[] = $field;
-                }
-            }
-            $final = $existing
-                ? "$existing " . implode(' ', $qf)
-                : implode(' ', $qf);
-            $dismax->setQueryFields($final);
+        // Parse existing qf into field => entry map.
+        $existingParts = $existing !== ''
+            ? preg_split('/\s+/', $existing) ?: []
+            : [];
+        $qfMap = [];
+        foreach ($existingParts as $part) {
+            $name = preg_replace('~\^.*$~', '', $part);
+            $qfMap[$name] = $part;
         }
+
+        // Apply boosts: update existing fields or add new ones.
+        foreach ($merged as $field => $boost) {
+            if (!is_string($field) || $field === '') {
+                continue;
+            }
+            $boost = (float) $boost;
+            if ($boost <= 0) {
+                continue;
+            }
+            $qfMap[$field] = $boost !== 1.0
+                ? "$field^$boost"
+                : $field;
+        }
+
+        // Respect the clause limit for the total qf.
+        $maxFields = $this->maxQueryFields();
+        if (count($qfMap) > $maxFields) {
+            $qfMap = array_slice($qfMap, 0, $maxFields, true);
+        }
+
+        $dismax->setQueryFields(implode(' ', $qfMap));
 
         return $this;
     }
@@ -1191,11 +1269,11 @@ class SolariumQuerier extends AbstractQuerier
             $allQuery = clone $this->select;
             $allQuery
                 ->setFields(['id'])
-                ->setRows(null)
-                ->setStart(null);
+                ->setRows(100)
+                ->setStart(0);
             $allQuery->getGrouping()
-                ->setLimit(null)
-                ->setOffset(null);
+                ->setLimit(1000000)
+                ->setOffset(0);
 
             $resultSetAll = $this->solariumClient->execute($allQuery);
 
@@ -2180,8 +2258,22 @@ class SolariumQuerier extends AbstractQuerier
             // "+" to require all terms (like refine behavior).
             $words = preg_split('/\s+/', $string, -1, PREG_SPLIT_NO_EMPTY);
             if (count($words) > 1) {
-                $escaped = array_map(fn ($w) => '+' . $this->select->getHelper()->escapeTerm($w), $words);
+                $escaped = array_map(function ($w) {
+                    // Structured identifiers (ark, doi, url…) with ":" or "/"
+                    // must be treated as phrases, not escaped terms, because
+                    // edismax + copyField analyzers strip these separators,
+                    // making backslash-escaped terms unmatchable.
+                    // Other characters like "." have no issue.
+                    if (strpbrk($w, ':/') !== false) {
+                        return '+' . $this->escapePhrase($w);
+                    }
+                    return '+' . $this->select->getHelper()->escapeTerm($w);
+                }, $words);
                 return implode(' ', $escaped);
+            }
+            // Single word with structured separators: use phrase.
+            if (strpbrk($string, ':/') !== false) {
+                return $this->escapePhrase($string);
             }
             return $this->select->getHelper()->escapeTerm($string);
         }
