@@ -254,17 +254,30 @@ class MapController extends AbstractActionController
         // Don't add a map if it exists at a upper level.
         $newMaps = [];
         $properties = $api->search('properties')->getContent();
-        $usedPropertyIds = $this->listUsedPropertyIds($resourceName);
+        $propertyStats = $this->analyseUsedPropertyIds($resourceName);
         foreach ($properties as $property) {
             // Skip property that are not used.
-            if (!in_array($property->id(), $usedPropertyIds)) {
+            if (!array_key_exists($property->id(), $propertyStats)) {
                 continue;
             }
 
             $term = $property->term();
+	    $stats = $propertyStats[$property->id()];
 
-            // For full text search (_t = single value, _txt = multivalued).
-            $name = strtr($term, ':', '_') . '_txt';
+	    if ($stats['z'] == $stats['used']) {
+	        // integer
+	        $name = strtr($term, ':', '_') . '_is';
+	        $solrFieldType = 'i';
+	    } elseif ($stats['r'] == $stats['used']) {
+	        // floating point
+	        $name = strtr($term, ':', '_') . '_ds';
+	        $solrFieldType = 'd';
+	    } else {
+                // For full text search (_t = single value, _txt = multivalued).
+                $name = strtr($term, ':', '_') . '_txt';
+	        $solrFieldType = 's';
+	    }
+
             $result = $createMap($name, $term, null, [], ['formatter' => '', 'label' => $property->label()]);
             if ($result) {
                 $newMaps[] = $name;
@@ -290,14 +303,23 @@ class MapController extends AbstractActionController
 
             if (!in_array($term, $skipTermTexts)) {
                 // For filters and facets.
-                $name = strtr($term, ':', '_') . '_ss';
-                $result = $createMap($name, $term, $term, [], ['formatter' => '', 'parts' => ['main'], 'label' => $property->label()]);
-                if ($result) {
-                    $newMaps[] = $name;
-                }
+		if ($solrFieldType == 's') {
+		    if (sqrt((int)$stats['used']) * 5 > $stats['numval']) {
+		        $name = strtr($term, ':', '_') . '_ss';
+                        $result = $createMap($name, $term, $term, [], ['formatter' => '', 'parts' => ['main'], 'label' => $property->label()]);
+                        if ($result) {
+                            $newMaps[] = $name;
+                        }
+		    } else {
+		        $this->messenger()->addWarning(new PsrMessage(
+                            'No facet index created for {term}: too many distinct values.', // @translate
+                            ['term' => $term]
+                        ));
+		    }
+		}
 
                 // For sort.
-                $name = strtr($term, ':', '_') . '_s';
+                $name = strtr($term, ':', '_') . '_' . $solrFieldType;
                 $result = $createMap($name, $term, null, [], ['formatter' => '', 'parts' => ['main'], 'label' => $property->label()]);
                 if ($result) {
                     $newMaps[] = $name;
@@ -357,10 +379,10 @@ class MapController extends AbstractActionController
         // Add all missing maps.
         $result = [];
         $properties = $api->search('properties')->getContent();
-        $usedPropertyIds = $this->listUsedPropertyIds($resourceName);
+        $propertyStats = $this->analyseUsedPropertyIds($resourceName);
         foreach ($properties as $property) {
             // Skip property that are used.
-            if (in_array($property->id(), $usedPropertyIds)) {
+            if (array_key_exists($property->id(), $propertyStats)) {
                 continue;
             }
 
@@ -644,14 +666,14 @@ class MapController extends AbstractActionController
     }
 
     /**
-     * Get all used properties for a resource.
+     * Get all used properties for a resource and analyse data types.
      *
      * @todo Use EasyMeta (but filtered by resource).
      *
      * @param string $resourceName
      * @return \Omeka\Api\Representation\PropertyRepresentation[]
      */
-    protected function listUsedPropertyIds($resourceName): array
+    protected function analyseUsedPropertyIds($resourceName): array
     {
         $resourceTypes = [
             'resources' => \Omeka\Entity\Resource::class,
@@ -668,9 +690,16 @@ class MapController extends AbstractActionController
         }
 
         $qb = $this->connection->createQueryBuilder()
-            ->select('DISTINCT value.property_id')
+            ->select(array(
+                'value.property_id',
+                'COUNT(*) used',
+                'COUNT(DISTINCT value.value) numval',
+                'SUM(value.value RLIKE \'^-?\\\\d+(\\\\.\\\\d+)?$\') r',
+                'SUM(value.value RLIKE \'^-?\\\\d+$\') z'
+            ))
             ->from('value', 'value')
             ->innerJoin('value', 'resource', 'resource', 'resource.id = value.resource_id')
+            ->groupBy('value.property_id')
             ->orderBy('value.property_id', 'ASC');
         if ($resourceName !== 'resources') {
             $qb
@@ -680,7 +709,7 @@ class MapController extends AbstractActionController
 
         return $this->connection
             ->executeQuery($qb, $qb->getParameters())
-            ->fetchFirstColumn();
+            ->fetchAllAssociativeIndexed();
     }
 
     /**
