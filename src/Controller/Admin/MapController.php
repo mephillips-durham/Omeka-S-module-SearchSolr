@@ -264,11 +264,11 @@ class MapController extends AbstractActionController
             $term = $property->term();
 	    $stats = $propertyStats[$property->id()];
 
-	    if ($stats['z'] == $stats['used']) {
+	    if ($stats['z'] >= 0.998 * $stats['used']) {
 	        // integer
 	        $name = strtr($term, ':', '_') . '_is';
 	        $solrFieldType = 'i';
-	    } elseif ($stats['r'] == $stats['used']) {
+	    } elseif ($stats['r'] >= 0.998 * $stats['used']) {
 	        // floating point
 	        $name = strtr($term, ':', '_') . '_ds';
 	        $solrFieldType = 'd';
